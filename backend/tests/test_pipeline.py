@@ -275,3 +275,190 @@ def test_domain_snapshot_contract():
         assert "module" in snap, f"{key}.domain_snapshot 应包含 module 字段"
         assert "artifact" in snap, f"{key}.domain_snapshot 应包含 artifact 字段"
         assert "count" in snap, f"{key}.domain_snapshot 应包含 count 字段"
+
+# ---------------------------------------------------------------------------
+# DAG 依赖环：可执行分区、审计、阻塞范围、重试、幂等
+# ---------------------------------------------------------------------------
+
+CYCLIC_NODES = "抽取管道,销售管道,汇总管道,税务管道"
+CYCLIC_EDGES = "抽取管道->销售管道,销售管道->抽取管道,销售管道->汇总管道"
+ACYCLIC_EDGES = "抽取管道->销售管道,销售管道->汇总管道"
+
+
+def _reset_dag(dependencies: str = CYCLIC_EDGES) -> None:
+    from app.engine import batch_pipeline as engine_module
+    from app.engine import execution_policy
+
+    reload_store()
+    engine_module.reset_runtime_state()
+    execution_policy.reset_simulation()
+    for dag in store.rows("pipeline_dag"):
+        if dag.get("图名称") == "销售编排样例":
+            dag["status"] = "已发布"
+            dag["节点列表"] = CYCLIC_NODES
+            dag["依赖关系"] = dependencies
+
+
+def test_dag_cycle_plan_lists_real_executable_partitions():
+    """成环时启动前必须拿到真实可执行分区：环内+下游阻塞，独立分支仍可执行。"""
+    _reset_dag()
+    plan = BatchPipelineEngine().plan_dag(dag_name="销售编排样例")
+
+    assert plan["has_cycle"] is True
+    assert plan["cycles"] == [["抽取管道", "销售管道"]]
+    assert plan["cycle_nodes"] == ["抽取管道", "销售管道"]
+    # 汇总管道依赖销售产物，必须一起阻塞
+    assert plan["blocked_nodes"] == ["抽取管道", "销售管道", "汇总管道"]
+    assert plan["executable_nodes"] == ["税务管道"]
+    assert plan["executable_partitions"] == ["分区2"]
+    assert plan["blocked_partitions"] == ["分区1"]
+
+
+def test_cycle_run_blocks_cycle_and_downstream_but_runs_independent_branch():
+    """环内节点和依赖其产物的分支都不能写数据；独立税务分支仍能给自己的表供数。"""
+    _reset_dag()
+    result = BatchPipelineEngine().run_dag(dag_name="销售编排样例", run_key="cycle-run")
+
+    status = {item["node"]: item["status"] for item in result["execution_log"]}
+    assert status == {
+        "抽取管道": "blocked",
+        "销售管道": "blocked",
+        "汇总管道": "blocked",
+        "税务管道": "completed",
+    }
+
+    writes = [
+        row for row in store.rows("result_writer")
+        if row.get("run_id") == result["run_id"]
+    ]
+    assert [row["输出目标"] for row in writes] == ["ads.tax_report"]
+    assert result["executable_partitions"] == ["分区2"]
+    assert result["blocked_partitions"] == ["分区1"]
+
+
+def test_audit_only_marks_landed_output_as_passed():
+    """输出审计只把确实落地的数据标为校验通过，并能定位因环无法出数的目标。"""
+    _reset_dag()
+    engine = BatchPipelineEngine()
+    result = engine.run_dag(dag_name="销售编排样例", run_key="audit-run")
+    report = engine.audit_report(run_id=result["run_id"])
+
+    passed = [a["管道名称"] for a in report["audits"] if a["校验结果"] == "校验通过"]
+    assert passed == ["税务管道"]
+    assert report["summary"]["written_targets"] == ["ads.tax_report"]
+    assert report["summary"]["passed_targets"] == ["ads.tax_report"]
+    assert report["summary"]["cycle_targets"] == ["dwd.extract_orders", "dwd.sales_orders"]
+    assert "ads.sales_summary" in report["summary"]["blocked_targets"]
+
+    cycle_audits = [
+        a for a in report["audits"] if a["校验结果"] == "未产出（依赖环）"
+    ]
+    assert {a["管道名称"] for a in cycle_audits} == {"抽取管道", "销售管道"}
+    assert all(a["已落地"] is False and a["输出行数"] == "0" for a in cycle_audits)
+
+
+def test_retry_links_previous_blocked_scope_and_history_keeps_unproduced():
+    """失败重试关联此前阻塞范围；修正环后再执行仍能查到此前未产出的分区。"""
+    _reset_dag()
+    engine = BatchPipelineEngine()
+
+    failed = engine.run_dag(
+        dag_name="销售编排样例", run_key="fail-run", fail_nodes=["税务管道"],
+    )
+    assert failed["status"] == "失败"
+    assert set(failed["blocked_scope"]["nodes"]) == {
+        "抽取管道", "销售管道", "汇总管道", "税务管道",
+    }
+
+    retried = engine.retry_run(previous_run_id=failed["run_id"], run_key="retry-run")
+    assert retried["retry_of"] == failed["run_id"]
+    assert retried["previous_blocked_scope"]["run_id"] == failed["run_id"]
+    assert set(retried["previous_blocked_scope"]["nodes"]) == set(
+        failed["blocked_scope"]["nodes"]
+    )
+    assert retried["executable_partitions"] == ["分区2"]
+
+    fixed = engine.update_dag_definition(
+        dag_name="销售编排样例", dependencies=ACYCLIC_EDGES,
+    )
+    assert fixed["has_cycle"] is False
+    rerun = engine.run_dag(dag_name="销售编排样例", run_key="fixed-run")
+    assert rerun["status"] == "成功"
+    assert rerun["has_cycle"] is False
+    assert rerun["executable_partitions"] == ["分区1", "分区2"]
+
+    history = engine.partition_history(target="dwd.sales_orders")
+    by_run = {item["run_id"]: item for item in history["partitions"]}
+    assert by_run[failed["run_id"]]["status"] == "未产出"
+    assert "dwd.sales_orders" in by_run[failed["run_id"]]["unproduced_targets"]
+    assert by_run[rerun["run_id"]]["status"] == "已产出"
+    assert "dwd.sales_orders" in by_run[rerun["run_id"]]["output_targets"]
+
+
+def test_concurrent_same_run_key_writes_only_once():
+    """并发触发同一次运行只保留一份已确认的分区结果。"""
+    import threading
+
+    _reset_dag()
+    results: list[dict[str, object]] = []
+
+    def trigger() -> None:
+        results.append(
+            BatchPipelineEngine().run_dag(
+                dag_name="销售编排样例", run_key="concurrent-run",
+            )
+        )
+
+    threads = [threading.Thread(target=trigger) for _ in range(6)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert len(results) == 6
+    assert len({item["run_id"] for item in results}) == 1
+    assert sum(1 for item in results if item.get("reused")) == 5
+
+    runs = [
+        row for row in store.rows("pipeline_run")
+        if row.get("run_key") == "concurrent-run"
+    ]
+    partitions = [
+        row for row in store.rows("pipeline_run_partition")
+        if row.get("run_key") == "concurrent-run"
+    ]
+    writes = [
+        row for row in store.rows("result_writer")
+        if row.get("run_id") == results[0]["run_id"]
+    ]
+    assert len(runs) == 1
+    assert len(partitions) == 2
+    assert sum(1 for row in partitions if row["confirmed"]) == 1
+    assert len(writes) == 1
+
+
+def test_audit_action_cannot_pass_unlanded_output():
+    """输出审计动作同样只认实际写入：没有落地记录的目标不能被标记通过。"""
+    from app.services import service_for
+
+    _reset_dag()
+    result = BatchPipelineEngine().run_dag(
+        dag_name="销售编排样例", run_key="audit-action-run",
+    )
+    service = service_for("output_audit")
+    audit_rows = [
+        row for row in store.rows("output_audit")
+        if row.get("run_id") == result["run_id"]
+    ]
+    assert audit_rows
+
+    for row in audit_rows:
+        entry, message = service.run_action(row["id"], "标记通过")
+        assert entry is not None
+        if row["输出目标"] == "ads.tax_report":
+            assert entry["校验结果"] == "校验通过"
+            assert entry["status"] == "已记录"
+        else:
+            assert entry["校验结果"] != "校验通过"
+            assert entry["status"] == "校验失败"
+            assert "没有实际落地" in message

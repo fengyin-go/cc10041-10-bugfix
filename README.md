@@ -79,5 +79,54 @@ npm run dev
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
 
+## 管道编排DAG的依赖校验与输出审计
+
+批量编排的入口在 `backend/app/engine/batch_pipeline.py`，依赖解析在
+`backend/app/engine/dag_graph.py`（纯图计算，无副作用）。
+
+### 启动前先拿可执行分区
+
+`POST /api/pipeline/batch/dag/plan`（也可在“管道编排DAG / 批量计算管道 /
+输出审计”页面点“解析依赖”）返回：
+
+- `cycles`：真正的依赖环（Tarjan 强连通分量），不会把环下游误判成环；
+- `blocked_nodes`：环内节点 **加上所有依赖其产物的下游分支**；
+- `executable_nodes` / `execution_order`：真实可执行的节点与拓扑顺序；
+- `partitions`：按弱连通分量切出的编排分区，`可执行` / `阻塞` / `部分可执行`。
+
+示例数据“销售编排样例”的图：
+
+```text
+抽取管道 ──▶ 销售管道 ──▶ 汇总管道        （抽取 ◀─▶ 销售 成环）
+税务管道                                   （独立分支）
+```
+
+解析结果：`分区1 = 抽取/销售/汇总` 阻塞，`分区2 = 税务` 可执行。值班人因此
+可以确认：**独立税务分支仍能给自己的表 `ads.tax_report` 供数**。
+
+### 执行规则
+
+- 成环节点、依赖其产物的下游分支、上游运行失败的节点都只登记阻塞，不写结果写入器；
+- 只有真正写入 `result_writer` 的节点才会产出“校验通过”的审计；
+- `POST /api/pipeline/batch/dag/run?run_key=...` 的 `run_key` 是幂等键，
+  并发触发同一 `run_key` 只执行一次，其余请求返回同一份 `run_id` 与分区结果；
+- `fail_nodes=节点名` 可注入一次执行失败，用于演示失败排障。
+
+### 审计与重试
+
+- `GET /api/pipeline/batch/audit?run_id=`：审计消费本次运行的分支执行回执，
+  只把实际落地的目标标为校验通过，并给出：
+  `summary.blocked_targets`、`summary.cycle_targets`（因环无法出数的目标）、
+  `confirmed_partitions` / `unproduced_partitions`，并与 `writes` 相互对照；
+- `POST /api/pipeline/batch/dag/retry?previous_run_id=`：重试新运行带
+  `retry_of` 与 `previous_blocked_scope`；
+- `GET /api/pipeline/batch/partitions/history?target=`：跨运行查分区产出，
+  修正环后再执行仍能查到此前未产出的分区；
+- `POST /api/pipeline/batch/dag/definition`：更新节点/依赖（修正环），之后用
+  同一 `run` 入口再次执行。
+
+“输出审计”的“标记通过 / 重新校验”动作也会先查结果写入器，没有实际写入记录
+的目标不会被标成校验通过。
+
 领域：数据工程
 子方向：数仓与数据湖

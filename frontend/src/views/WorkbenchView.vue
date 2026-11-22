@@ -22,6 +22,12 @@
       </article>
     </div>
 
+    <DagRunPanel
+      v-if="showDagPanel"
+      :module-key="meta.key"
+      class="module-dag-panel"
+    />
+
     <p class="status-legend">
       <span v-for="item in statusSummary" :key="item.status" class="legend-item">
         {{ item.status }}：{{ item.count }}
@@ -103,10 +109,12 @@ import {
   moduleMeta,
   runAction as applyAction,
 } from '@/api/backend-service'
+import DagRunPanel from '@/components/DagRunPanel.vue'
 import type { EntryRow } from '@/data/types'
 
 const props = defineProps<{ moduleKey: string }>()
 const meta = moduleMeta(props.moduleKey)
+const showDagPanel = ['pipeline_dag', 'output_audit', 'batch_pipeline'].includes(meta.key)
 const rows = ref<EntryRow[]>([])
 const total = ref(0)
 const errorMessage = ref('')
